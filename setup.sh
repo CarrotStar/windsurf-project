@@ -5,10 +5,13 @@ set -e
 
 echo "--- Grid Bot Environment Setup ---"
 
-# Ensure python3-venv is installed for creating virtual environments
-echo "Updating package list and installing python3-venv..."
+# Ensure the correct python3-venv package is installed for creating virtual environments
+echo "Updating package list..."
 sudo apt-get update
-sudo apt-get install -y python3-venv
+
+PY_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+echo "Detected Python version: $PY_VERSION. Ensuring python${PY_VERSION}-venv is installed..."
+sudo apt-get install -y "python${PY_VERSION}-venv"
 
 # Create a Python virtual environment named 'venv' if it doesn't exist
 if [ ! -d "venv" ]; then
