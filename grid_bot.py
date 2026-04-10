@@ -147,6 +147,14 @@ class GridBot:
             self.db.clear_symbol(self.sym.symbol)
             return False
 
+        # Check for mode mismatch (paper vs live) before restoring
+        for row in open_rows:
+            is_paper = str(row["id"]).startswith("paper_")
+            if self.config.PAPER_TRADING != is_paper:
+                logger.warning("[%s] Trading mode switched (paper vs live) since last run. Starting fresh grid.", self.sym.symbol)
+                self.db.clear_symbol(self.sym.symbol)
+                return False
+
         # Restore state
         self.state.total_profit = float(saved["total_profit"])
         self.state.total_trades = int(saved["total_trades"])
@@ -238,6 +246,24 @@ class GridBot:
     # ------------------------------------------------------------------
 
     def _setup_grid(self, current_price: float) -> None:
+        # Check if investment per grid meets the exchange minimum notional
+        amount_per_grid = self.sym.investment / self.sym.grid_count
+        min_cost = self.exchange.get_market_min_cost()
+        
+        if min_cost and amount_per_grid < min_cost:
+            err_msg = (
+                f"❌ *Grid Setup Failed*\n"
+                f"Symbol: `{self.sym.symbol}`\n"
+                f"Your investment per grid (`${amount_per_grid:,.2f}`) is less than "
+                f"the exchange minimum required notional (`${min_cost:,.2f}`).\n"
+                f"👉 *Fix*: Increase `INVESTMENT` or decrease `GRID_COUNT`."
+            )
+            logger.error("[%s] Grid setup failed: amount per grid %.2f < min cost %.2f", self.sym.symbol, amount_per_grid, min_cost)
+            self.telegram.send_message(err_msg)
+            self.sheets.log_bot_event(f"SETUP_FAILED [{self.sym.symbol}]", err_msg)
+            self.running = False
+            return
+
         self.state.levels = self._calculate_levels()
         self.state.initial_price = current_price
         logger.info("[%s] Grid levels: %s", self.sym.symbol, [f"{p:.2f}" for p in self.state.levels])
@@ -295,7 +321,7 @@ class GridBot:
         profit = 0.0
 
         if order.order_type == "buy":
-            sell_price = round(order.price + step, 8)
+            sell_price = self.exchange.format_price(order.price + step)
             if sell_price <= self.sym.upper_price:
                 sell_amount = self._order_amount(sell_price)
                 new_order = self.exchange.place_order(
@@ -306,7 +332,7 @@ class GridBot:
                     self.db.upsert_order(new_order, self.sym.symbol)
 
         elif order.order_type == "sell":
-            buy_price = round(order.price - step, 8)
+            buy_price = self.exchange.format_price(order.price - step)
             profit = (order.price - buy_price) * order.amount
             self.state.total_profit += profit
 
@@ -384,7 +410,7 @@ class GridBot:
     def _calculate_levels(self) -> list[float]:
         step = self._grid_step()
         return [
-            round(self.sym.lower_price + i * step, 8)
+            self.exchange.format_price(self.sym.lower_price + i * step)
             for i in range(self.sym.grid_count + 1)
         ]
 
@@ -393,7 +419,7 @@ class GridBot:
 
     def _order_amount(self, price: float) -> float:
         amount_per_grid = self.sym.investment / self.sym.grid_count
-        return round(amount_per_grid / price, 6)
+        return self.exchange.format_amount(amount_per_grid / price)
 
     def _check_range(self, current_price: float) -> None:
         in_range = self.sym.lower_price <= current_price <= self.sym.upper_price

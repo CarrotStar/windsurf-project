@@ -104,6 +104,39 @@ class ExchangeClient:
             logger.warning("Failed to fetch funding rate for %s: %s", self.symbol, exc)
             return {}
 
+    def get_market_min_cost(self) -> float:
+        """Fetch the minimum order value (notional) from exchange limits."""
+        if self.paper_trading:
+            return 0.0
+        try:
+            if not self._exchange.markets:
+                self._exchange.load_markets()
+            market = self._exchange.market(self.symbol)
+            return float(market.get("limits", {}).get("cost", {}).get("min") or 0.0)
+        except ccxt.BaseError as exc:
+            logger.warning("Failed to fetch market limits for %s: %s", self.symbol, exc)
+            return 0.0
+
+    def format_price(self, price: float) -> float:
+        """Format price according to exchange precision rules."""
+        try:
+            if not self._exchange.markets:
+                self._exchange.load_markets()
+            return float(self._exchange.price_to_precision(self.symbol, price))
+        except ccxt.BaseError as exc:
+            logger.debug("Failed to format price for %s: %s", self.symbol, exc)
+            return round(price, 4)
+
+    def format_amount(self, amount: float) -> float:
+        """Format amount according to exchange precision rules."""
+        try:
+            if not self._exchange.markets:
+                self._exchange.load_markets()
+            return float(self._exchange.amount_to_precision(self.symbol, amount))
+        except ccxt.BaseError as exc:
+            logger.debug("Failed to format amount for %s: %s", self.symbol, exc)
+            return round(amount, 6)
+
     # ------------------------------------------------------------------
     # Paper trading implementation
     # ------------------------------------------------------------------
@@ -183,6 +216,9 @@ class ExchangeClient:
             return None
 
     def _live_cancel(self, order_id: str) -> bool:
+        if order_id.startswith("paper_"):
+            logger.warning("Skipping cancellation of paper order in live mode: %s", order_id)
+            return False
         try:
             self._exchange.cancel_order(order_id, self.symbol)
             logger.info("Order cancelled: %s", order_id)
@@ -194,6 +230,9 @@ class ExchangeClient:
     def _live_check_fills(self, open_orders: dict[str, Order]) -> list[Order]:
         filled: list[Order] = []
         for order_id, order in list(open_orders.items()):
+            if order_id.startswith("paper_"):
+                logger.warning("Skipping check of paper order in live mode: %s", order_id)
+                continue
             try:
                 result = self._exchange.fetch_order(order_id, self.symbol)
                 if result["status"] in ("closed", "filled"):
@@ -243,7 +282,14 @@ class ExchangeClient:
 
         exchange: ccxt.Exchange = exchange_cls(params)
         if not self.paper_trading and self.config.TESTNET:
-            if hasattr(exchange, "set_sandbox_mode"):
-                exchange.set_sandbox_mode(True)
-                logger.info("Exchange sandbox/testnet mode enabled")
+            if self.config.EXCHANGE.lower() == "binance" and self.is_futures:
+                if hasattr(exchange, "enable_demo_trading"):
+                    exchange.enable_demo_trading(True)
+                    logger.info("Binance futures demo trading mode enabled")
+                else:
+                    logger.warning("Binance demo trading mode not found in this ccxt version. Consider upgrading ccxt.")
+            else:
+                if hasattr(exchange, "set_sandbox_mode"):
+                    exchange.set_sandbox_mode(True)
+                    logger.info("Exchange sandbox/testnet mode enabled")
         return exchange
