@@ -19,6 +19,12 @@ if [ ! -d "venv" ]; then
     python3 -m venv venv
 fi
 
+# Verify that the virtual environment was created successfully
+if [ ! -f "venv/bin/activate" ]; then
+    echo "❌ ERROR: Virtual environment creation failed. The 'venv/bin/activate' script was not found."
+    exit 1
+fi
+
 # Activate the virtual environment
 source venv/bin/activate
 
