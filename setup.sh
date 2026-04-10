@@ -13,15 +13,18 @@ PY_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.versi
 echo "Detected Python version: $PY_VERSION."
 sudo apt-get install -y "python${PY_VERSION}-venv" tmux
 
-# Create a Python virtual environment named 'venv' if it doesn't exist
-if [ ! -d "venv" ]; then
+# If the virtual environment is not set up correctly, (re)create it.
+if [ ! -f "venv/bin/activate" ]; then
+    echo "Virtual environment is incomplete or missing. Recreating..."
+    # Remove potentially broken venv directory before recreating
+    rm -rf venv
     echo "Creating Python virtual environment..."
     python3 -m venv venv
 fi
 
 # Verify that the virtual environment was created successfully
 if [ ! -f "venv/bin/activate" ]; then
-    echo "❌ ERROR: Virtual environment creation failed. The 'venv/bin/activate' script was not found."
+    echo "❌ ERROR: Virtual environment creation failed even after retry. Please check Python installation and permissions."
     exit 1
 fi
 
