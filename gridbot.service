@@ -1,0 +1,23 @@
+[Unit]
+Description=Grid Trading Bot
+After=network.target
+
+[Service]
+User=ubuntu
+Group=ubuntu
+SyslogIdentifier=gridbot
+WorkingDirectory=/home/ubuntu/windsurf-project
+ExecStart=/home/ubuntu/windsurf-project/venv/bin/python3 /home/ubuntu/windsurf-project/main.py
+
+# Restart behavior
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.targetๅ
