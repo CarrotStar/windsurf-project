@@ -31,12 +31,14 @@ fi
 # Activate the virtual environment
 source venv/bin/activate
 
-echo "Installing Python dependencies from requirements.txt..."
+echo "Upgrading pip and installing Python dependencies from requirements.txt..."
+pip install --upgrade pip
 pip install -r requirements.txt
 
 echo ""
 echo "✅ Setup complete!"
-echo "To run the bot, first activate the environment with: source venv/bin/activate"
-echo "Then, for persistent execution, run inside a tmux session:"
-echo "  1. tmux new -s gridbot"
-echo "  2. python3 main.py (then press Ctrl+b, d to detach)"
+echo ""
+echo "Next steps:"
+echo "1. Create your .env file with your production credentials."
+echo "2. Make the run script executable: chmod +x run.sh"
+echo "3. Start the bot with: ./run.sh"
