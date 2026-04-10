@@ -13,6 +13,9 @@ if tmux has-session -t gridbot 2>/dev/null; then
   echo "Attaching to existing 'gridbot' tmux session..."
   tmux attach -t gridbot
 else
-  echo "Creating new 'gridbot' tmux session."
-  tmux new -s gridbot
+  echo "No existing session found. Creating new 'gridbot' session and starting the bot..."
+  # สร้าง session ใหม่ในเบื้องหลัง (-d), ตั้งชื่อว่า 'gridbot' (-s),
+  # และรันบอทข้างใน จากนั้นจึง attach เข้าไปที่ session นั้น
+  tmux new-session -d -s gridbot "python3 main.py"
+  tmux attach -t gridbot
 fi
