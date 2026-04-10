@@ -22,10 +22,11 @@ class GridState:
     start_time: datetime = field(default_factory=datetime.now)
     initial_price: float = 0.0
     recovered: bool = False  # True when state was loaded from DB
+    net_position_amount: float = 0.0
     # Funding rate tracking (futures only)
-    total_funding_cost: float = 0.0
-    last_funding_time: float = 0.0   # unix ts of last settlement we applied
-    current_funding_rate: float = 0.0
+    total_funding_profit: float = 0.0
+    next_funding_ts_ms: float = 0.0
+    last_known_funding_rate: float = 0.0
 
 
 class GridBot:
@@ -164,6 +165,14 @@ class GridBot:
         self.state.levels = self._calculate_levels()
         self.state.recovered = True
 
+        # Recover futures-specific state
+        if self.exchange.is_futures:
+            self.state.total_funding_profit = float(saved.get("total_funding_profit", 0.0))
+            self.state.next_funding_ts_ms = float(saved.get("next_funding_ts_ms", 0.0))
+            self.state.last_known_funding_rate = float(saved.get("last_known_funding_rate", 0.0))
+            self.state.net_position_amount = self.db.get_net_filled_amount(self.sym.symbol)
+            logger.info("[%s] Recovered net position: %.6f", self.sym.symbol, self.state.net_position_amount)
+
         for row in open_rows:
             order = Order(
                 id=row["id"],
@@ -212,6 +221,9 @@ class GridBot:
                 self.state.open_orders.pop(order.id, None)
                 self._handle_fill(order)
 
+            # Handle futures funding fees
+            self._check_funding(current_price)
+
             # Risk management check
             if self._risk_limit_breached():
                 return
@@ -225,7 +237,14 @@ class GridBot:
                 self._last_summary_at = time.time()
 
             # Persist cumulative stats to DB
-            self.db.update_stats(self.sym.symbol, self.state.total_profit, self.state.total_trades)
+            self.db.update_stats(
+                symbol=self.sym.symbol,
+                total_profit=self.state.total_profit,
+                total_trades=self.state.total_trades,
+                total_funding_profit=self.state.total_funding_profit,
+                next_funding_ts_ms=self.state.next_funding_ts_ms,
+                last_known_funding_rate=self.state.last_known_funding_rate,
+            )
 
             # Keep Google Sheets summary row up to date
             self.sheets.update_summary({
@@ -293,6 +312,9 @@ class GridBot:
             total_profit=0.0,
             total_trades=0,
             start_time=self.state.start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            total_funding_profit=0.0,
+            next_funding_ts_ms=0.0,
+            last_known_funding_rate=0.0,
         )
 
         step = self._grid_step()
@@ -321,6 +343,7 @@ class GridBot:
         profit = 0.0
 
         if order.order_type == "buy":
+            self.state.net_position_amount += order.amount
             sell_price = self.exchange.format_price(order.price + step)
             if sell_price <= self.sym.upper_price:
                 sell_amount = self._order_amount(sell_price)
@@ -332,6 +355,7 @@ class GridBot:
                     self.db.upsert_order(new_order, self.sym.symbol)
 
         elif order.order_type == "sell":
+            self.state.net_position_amount -= order.amount
             buy_price = self.exchange.format_price(order.price - step)
             profit = (order.price - buy_price) * order.amount
             self.state.total_profit += profit
@@ -374,9 +398,9 @@ class GridBot:
         )
         self.telegram.send_message(msg)
         logger.info(
-            "[%s] Fill: %s @ %.4f | amount=%.6f | profit=%.6f | total=%.6f",
+            "[%s] Fill: %s @ %.4f | amount=%.6f | profit=%.6f | total=%.6f | pos=%.4f",
             self.sym.symbol, order.order_type, order.filled_price or 0, order.amount,
-            profit, self.state.total_profit,
+            profit, self.state.total_profit, self.state.net_position_amount,
         )
 
     # ------------------------------------------------------------------
@@ -440,18 +464,61 @@ class GridBot:
     def _send_summary(self, current_price: float) -> None:
         runtime = _runtime(self.state.start_time)
         roi = (self.state.total_profit / self.sym.investment) * 100 if self.sym.investment else 0
+        funding_line = ""
+        if self.exchange.is_futures:
+            funding_line = f"Funding P/L  : `${self.state.total_funding_profit:,.6f}`\n"
         msg = (
             f"📊 *Hourly Summary*\n"
             f"Symbol       : `{self.sym.symbol}`\n"
             f"Current Price: `{current_price:,.4f}`\n"
             f"Open Orders  : `{len(self.state.open_orders)}`\n"
             f"Total Trades : `{self.state.total_trades}`\n"
+            f"{funding_line}"
             f"Total Profit : `${self.state.total_profit:,.6f}` ({roi:+.3f}%)\n"
             f"Runtime      : `{runtime}`"
         )
         self.telegram.send_message(msg)
         self.sheets.log_bot_event("HOURLY_SUMMARY", msg)
         logger.info("Hourly summary sent")
+
+    def _check_funding(self, current_price: float) -> None:
+        """If futures, check for and apply funding fees."""
+        if not self.exchange.is_futures:
+            return
+
+        # If we have a pending funding event and its time has passed, apply the fee
+        current_ts_ms = time.time() * 1000
+        if 0 < self.state.next_funding_ts_ms < current_ts_ms:
+            position_value = self.state.net_position_amount * current_price
+            
+            # Funding profit = - Position Value * Funding Rate
+            funding_profit = -1 * position_value * self.state.last_known_funding_rate
+
+            self.state.total_funding_profit += funding_profit
+            self.state.total_profit += funding_profit
+            
+            logger.info(
+                "[%s] Funding event processed. Position: %.4f, Rate: %.6f, Profit: %.6f",
+                self.sym.symbol, self.state.net_position_amount, self.state.last_known_funding_rate, funding_profit
+            )
+            self.telegram.send_message(
+                f"💸 *Funding Fee* — `{self.sym.symbol}`\n"
+                f"Position     : `{self.state.net_position_amount:.4f}`\n"
+                f"Funding Rate : `{self.state.last_known_funding_rate * 100:.4f}%`\n"
+                f"Profit/Loss  : `${funding_profit:,.6f}`\n"
+                f"Total Profit : `${self.state.total_profit:,.6f}`"
+            )
+            self.state.next_funding_ts_ms = 0  # Mark as processed
+
+        # Always try to get the latest funding info for the *next* event
+        try:
+            funding_info = self.exchange.fetch_funding_rate()
+            if funding_info and funding_info.get("next_time"):
+                if funding_info["next_time"] > current_ts_ms:
+                    self.state.next_funding_ts_ms = funding_info["next_time"]
+                    self.state.last_known_funding_rate = funding_info["rate"]
+        except Exception as exc:
+            logger.warning("[%s] Could not update funding info: %s", self.sym.symbol, exc)
 
 
 # ------------------------------------------------------------------

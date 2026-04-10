@@ -32,23 +32,6 @@ def setup_logging() -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-def run_bot(
-    sym: SymbolConfig,
-    telegram: TelegramNotifier,
-    sheets: GoogleSheetsLogger,
-    db: Database,
-) -> None:
-    """Entry point for each symbol thread."""
-    logger = logging.getLogger(f"bot.{sym.symbol.replace('/', '')}")
-    try:
-        exchange = ExchangeClient(Config, symbol=sym.symbol)
-        bot = GridBot(Config, sym, exchange, telegram, sheets, db)
-        bot.run()
-    except Exception as exc:
-        logger.critical("[%s] Fatal error: %s", sym.symbol, exc, exc_info=True)
-        telegram.send_message(f"💀 *Fatal Error — {sym.symbol} Bot Crashed*\n`{exc}`")
-
-
 def main() -> None:
     setup_logging()
     logger = logging.getLogger(__name__)
@@ -83,24 +66,34 @@ def main() -> None:
     symbol_configs = Config.get_symbol_configs()
     logger.info("Starting %d symbol bot(s): %s", len(symbol_configs), [s.symbol for s in symbol_configs])
 
+    bots: list[GridBot] = []
     threads: list[threading.Thread] = []
     for sym in symbol_configs:
+        # Each bot gets its own exchange client, but shares other services.
+        # The bot instance is created here so we can control it from the main thread.
+        exchange = ExchangeClient(Config, symbol=sym.symbol)
+        bot = GridBot(Config, sym, exchange, telegram, sheets, db)
+        bots.append(bot)
+
         t = threading.Thread(
-            target=run_bot,
-            args=(sym, telegram, sheets, db),
+            target=bot.run,  # The bot's run method is the entry point for the thread
             name=f"bot-{sym.symbol.replace('/', '')}",
-            daemon=True,
         )
         t.start()
         threads.append(t)
         logger.info("Thread started for %s", sym.symbol)
 
-    # Keep main thread alive; Ctrl+C will propagate to daemon threads
+    # Keep main thread alive and wait for KeyboardInterrupt (Ctrl+C) for graceful shutdown.
     try:
         for t in threads:
-            t.join()
+            t.join()  # This will block until all bot threads have completed.
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt — stopping all bots…")
+        for bot in bots:
+            bot.running = False  # Signal each bot's main loop to exit
+        for t in threads:
+            t.join()  # Wait for each thread to finish its cleanup (_stop() method)
+        logger.info("All bots have stopped.")
         sys.exit(0)
 
 

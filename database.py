@@ -31,9 +31,12 @@ CREATE TABLE IF NOT EXISTS bot_state (
     investment    DOUBLE PRECISION NOT NULL,
     initial_price DOUBLE PRECISION NOT NULL,
     total_profit  DOUBLE PRECISION NOT NULL DEFAULT 0,
+    total_funding_profit    DOUBLE PRECISION NOT NULL DEFAULT 0,
     total_trades  INTEGER          NOT NULL DEFAULT 0,
     start_time    TIMESTAMP        NOT NULL,
-    last_update   TIMESTAMP        NOT NULL
+    last_update   TIMESTAMP        NOT NULL,
+    next_funding_ts_ms      DOUBLE PRECISION NOT NULL DEFAULT 0,
+    last_known_funding_rate DOUBLE PRECISION NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS orders (
@@ -95,6 +98,13 @@ DO $$ BEGIN
     ) THEN
         DROP TABLE IF EXISTS trades;
     END IF;
+END $$;
+
+-- Add new columns for funding fee tracking (added in April 2026)
+DO $$ BEGIN
+    ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS total_funding_profit    DOUBLE PRECISION NOT NULL DEFAULT 0;
+    ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS next_funding_ts_ms      DOUBLE PRECISION NOT NULL DEFAULT 0;
+    ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS last_known_funding_rate DOUBLE PRECISION NOT NULL DEFAULT 0;
 END $$;
 """
 
@@ -175,6 +185,9 @@ class Database:
         total_profit: float,
         total_trades: int,
         start_time: str,
+        total_funding_profit: float,
+        next_funding_ts_ms: float,
+        last_known_funding_rate: float,
     ) -> None:
         now = datetime.now()
         with self._conn() as conn:
@@ -183,22 +196,27 @@ class Database:
                     """
                     INSERT INTO bot_state
                         (symbol, lower_price, upper_price, grid_count, investment,
-                         initial_price, total_profit, total_trades, start_time, last_update)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         initial_price, total_profit, total_trades, start_time, last_update,
+                         total_funding_profit, next_funding_ts_ms, last_known_funding_rate)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (symbol) DO UPDATE SET
-                        lower_price   = EXCLUDED.lower_price,
-                        upper_price   = EXCLUDED.upper_price,
-                        grid_count    = EXCLUDED.grid_count,
-                        investment    = EXCLUDED.investment,
-                        initial_price = EXCLUDED.initial_price,
-                        total_profit  = EXCLUDED.total_profit,
-                        total_trades  = EXCLUDED.total_trades,
-                        start_time    = EXCLUDED.start_time,
-                        last_update   = EXCLUDED.last_update
+                        lower_price             = EXCLUDED.lower_price,
+                        upper_price             = EXCLUDED.upper_price,
+                        grid_count              = EXCLUDED.grid_count,
+                        investment              = EXCLUDED.investment,
+                        initial_price           = EXCLUDED.initial_price,
+                        total_profit            = EXCLUDED.total_profit,
+                        total_trades            = EXCLUDED.total_trades,
+                        start_time              = EXCLUDED.start_time,
+                        last_update             = EXCLUDED.last_update,
+                        total_funding_profit    = EXCLUDED.total_funding_profit,
+                        next_funding_ts_ms      = EXCLUDED.next_funding_ts_ms,
+                        last_known_funding_rate = EXCLUDED.last_known_funding_rate
                     """,
                     (
                         symbol, lower_price, upper_price, grid_count, investment,
                         initial_price, total_profit, total_trades, start_time, now,
+                        total_funding_profit, next_funding_ts_ms, last_known_funding_rate,
                     ),
                 )
 
@@ -209,16 +227,26 @@ class Database:
                 row = cur.fetchone()
                 return dict(row) if row else None
 
-    def update_stats(self, symbol: str, total_profit: float, total_trades: int) -> None:
+    def update_stats(
+        self,
+        symbol: str,
+        total_profit: float,
+        total_trades: int,
+        total_funding_profit: float,
+        next_funding_ts_ms: float,
+        last_known_funding_rate: float,
+    ) -> None:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     UPDATE bot_state
-                    SET total_profit = %s, total_trades = %s, last_update = %s
+                    SET total_profit = %s, total_trades = %s, last_update = %s,
+                        total_funding_profit = %s, next_funding_ts_ms = %s, last_known_funding_rate = %s
                     WHERE symbol = %s
                     """,
-                    (total_profit, total_trades, datetime.now(), symbol),
+                    (total_profit, total_trades, datetime.now(), total_funding_profit,
+                     next_funding_ts_ms, last_known_funding_rate, symbol),
                 )
 
     # ------------------------------------------------------------------
@@ -299,6 +327,20 @@ class Database:
                     (symbol,),
                 )
                 return float(cur.fetchone()[0])
+
+    def get_net_filled_amount(self, symbol: str) -> float:
+        """Calculate the net position size from all filled orders."""
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COALESCE(SUM(CASE WHEN order_type = 'buy' THEN amount ELSE -amount END), 0)
+                    FROM orders WHERE symbol = %s AND status = 'filled'
+                    """,
+                    (symbol,),
+                )
+                res = cur.fetchone()
+                return float(res[0]) if res else 0.0
 
     # ------------------------------------------------------------------
     # Config check / reset  (per-symbol)
