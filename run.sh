@@ -6,6 +6,13 @@
 
 set -e
 
+ๅ# Check if already inside a tmux session to prevent nesting.
+if [ -n "$TMUX" ]; then
+  echo "❌ ERROR: You are already inside a tmux session."
+  echo "Please exit this session first (type 'exit' or press Ctrl+b, d) before running this script."
+  exit 1
+fi
+
 # Activate virtual environment
 source venv/bin/activate
 
