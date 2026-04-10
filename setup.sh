@@ -6,12 +6,12 @@ set -e
 echo "--- Grid Bot Environment Setup ---"
 
 # Ensure the correct python3-venv package is installed for creating virtual environments
-echo "Updating package list..."
+echo "Updating package list and installing system dependencies (venv, tmux)..."
 sudo apt-get update
 
 PY_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-echo "Detected Python version: $PY_VERSION. Ensuring python${PY_VERSION}-venv is installed..."
-sudo apt-get install -y "python${PY_VERSION}-venv"
+echo "Detected Python version: $PY_VERSION."
+sudo apt-get install -y "python${PY_VERSION}-venv" tmux
 
 # Create a Python virtual environment named 'venv' if it doesn't exist
 if [ ! -d "venv" ]; then
@@ -28,4 +28,6 @@ pip install -r requirements.txt
 echo ""
 echo "✅ Setup complete!"
 echo "To run the bot, first activate the environment with: source venv/bin/activate"
-echo "Then run the bot with: python3 main.py"
+echo "Then, for persistent execution, run inside a tmux session:"
+echo "  1. tmux new -s gridbot"
+echo "  2. python3 main.py (then press Ctrl+b, d to detach)"
