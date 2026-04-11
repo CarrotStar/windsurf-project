@@ -1,0 +1,315 @@
+diff --git a/Plan.md b/Plan.md
+new file mode 100644
+index 0000000..740aa5f
+--- /dev/null
++++ b/Plan.md
+@@ -0,0 +1,309 @@
++# 📋 Grid Trading Bot — Improvement Plan
++
++> วิเคราะห์จากโค้ดทั้งโปรเจกต์ (วันที่ 11 เม.ย. 2026)
++
++---
++
++## 🔴 P0 — Critical (ควรแก้ก่อน deploy production)
++
++### 1. Database Connection Resilience
++
++**ไฟล์**: `database.py`
++**ปัญหา**: ถ้า AWS RDS restart หรือ network ขาดชั่วคราว connection pool จะพัง แล้วบอทจะ crash ทันที ไม่มี auto-reconnect
++**แนวทาง**:
++
++- เพิ่ม retry logic ใน `_conn()` context manager เมื่อ `getconn()` fail ให้ rebuild pool แล้วลองใหม่
++- เพิ่ม `health_check()` method ที่ทำ `SELECT 1` เพื่อเช็คว่า connection ยังอยู่
++- พิจารณาใส่ `keepalives` params ใน connection เพื่อ detect dead connection เร็วขึ้น
++
++```python
++# ตัวอย่าง: auto-reconnect
++@contextmanager
++def _conn(self):
++    try:
++        conn = self._pool.getconn()
++    except Exception:
++        logger.warning("Connection pool broken — rebuilding")
++        self._pool = self._build_pool()
++        conn = self._pool.getconn()
++    try:
++        yield conn
++        conn.commit()
++    except Exception:
++        conn.rollback()
++        raise
++    finally:
++        self._pool.putconn(conn)
++```
++
++---
++
++### 2. Exchange API Rate Limit & Retry
++
++**ไฟล์**: `exchange_client.py`
++**ปัญหา**: ไม่มี retry / exponential backoff เมื่อ Exchange API ส่ง rate limit error (HTTP 429) หรือ temporary failure (5xx) → order อาจหายหรือบอทหยุดทำงาน
++**แนวทาง**:
++
++- Wrap ccxt calls ด้วย retry decorator (exponential backoff)
++- จับ `ccxt.RateLimitExceeded`, `ccxt.NetworkError`, `ccxt.ExchangeNotAvailable` แยกจาก error อื่น
++- ใส่ `enableRateLimit: True` ใน ccxt exchange config (ccxt มี built-in rate limiter)
++
++```python
++# ตัวอย่าง: เพิ่ม enableRateLimit
++def _build_exchange(self):
++    params = {
++        "options": {"defaultType": market_type},
++        "enableRateLimit": True,              # ← เพิ่มบรรทัดนี้
++        "rateLimit": 100,                     # milliseconds between requests
++    }
++```
++
++---
++
++### 3. SIGTERM Handling สำหรับ Production
++
++**ไฟล์**: `main.py`
++**ปัญหา**: `gridbot.service` ใช้ `Restart=always` แต่ main.py catch แค่ `KeyboardInterrupt` (SIGINT) — เมื่อ systemd ส่ง `SIGTERM` (default stop signal) บอทจะถูกฆ่าทันทีโดยไม่ cancel orders
++**แนวทาง**:
++
++- เพิ่ม `signal.signal(signal.SIGTERM, handler)` ใน `main()` ให้ set `bot.running = False` เหมือนกับ Ctrl+C
++- ตรวจสอบว่า `gridbot.service` มี `TimeoutStopSec` เพียงพอให้ cancel orders เสร็จ
++
++```python
++import signal
++
++def main():
++    # ... setup ...
++    stop_event = threading.Event()
++
++    def shutdown(signum, frame):
++        logger.info("Signal %s received — stopping bots", signum)
++        for bot in bots:
++            bot.running = False
++        stop_event.set()
++
++    signal.signal(signal.SIGINT, shutdown)
++    signal.signal(signal.SIGTERM, shutdown)
++```
++
++---
++
++### 4. Typo ใน gridbot.service
++
++**ไฟล์**: `gridbot.service`
++**ปัญหา**: บรรทัดสุดท้าย `WantedBy=multi-user.targetๅ` มี **ตัวอักษรภาษาไทย `ๅ`** ต่อท้าย → systemd จะ parse ผิด ทำให้ `systemctl enable gridbot` ไม่ทำงาน
++**แนวทาง**: ลบตัว `ๅ` ออก → `WantedBy=multi-user.target`
++
++---
++
++## 🟡 P1 — Important (ควรทำเพื่อความเสถียรและ maintainability)
++
++### 5. Telegram Rate Limit Protection
++
++**ไฟล์**: `telegram_notifier.py`
++**ปัญหา**: Telegram Bot API มี rate limit (30 msg/sec ต่อ chat, 20 msg/min ต่อ group) — ถ้ามีหลาย symbol fill พร้อมกัน อาจโดน block
++**แนวทาง**:
++
++- เพิ่ม message queue แบบ FIFO + rate limiter (เช่น token bucket) ส่งไม่เกิน 1 msg/sec
++- Batch notifications ที่เกิดพร้อมกัน (เช่น 3 fills ใน tick เดียว → ส่ง 1 ข้อความรวม)
++- เพิ่ม retry เมื่อโดน HTTP 429
++
++---
++
++### 6. Google Sheets Batching
++
++**ไฟล์**: `google_sheets_logger.py`
++**ปัญหา**: ทุก trade จะ call Google Sheets API 1 ครั้ง (append) + update summary อีก 1 ครั้ง — ถ้ามีหลาย fills ใน cycle เดียว อาจชนก quota (100 requests / 100 seconds)
++**แนวทาง**:
++
++- Buffer trades แล้ว flush เป็น batch ทุก N วินาที หรือเมื่อ buffer เต็ม
++- ใช้ `batchUpdate` API แทน individual update
++
++---
++
++### 7. Pin Dependencies Versions
++
++**ไฟล์**: `requirements.txt`
++**ปัญหา**: ไม่มี version pinning (`ccxt`, `psycopg2-binary`, etc.) → pip install อาจได้ version ใหม่ที่ breaking change แล้วบอทพัง
++**แนวทาง**:
++
++```
++ccxt==4.4.26
++psycopg2-binary==2.9.10
++python-dotenv==1.0.1
++requests==2.32.3
++google-api-python-client==2.155.0
++google-auth-oauthlib==1.2.1
++```
++
++---
++
++### 8. Config Validation ที่ละเอียดขึ้น
++
++**ไฟล์**: `config.py`
++**ปัญหา**: `validate()` ตรวจ grid params แล้ว แต่ยังขาดบาง case:
++
++- `LEVERAGE` ≤ 0 จะทำให้ margin calculation ผิด
++- `CHECK_INTERVAL` ≤ 0 จะทำให้ loop spin 100% CPU
++- `MARKET_TYPE` ไม่ใช่ `spot` หรือ `future` → ccxt จะ error
++  **แนวทาง**: เพิ่ม validation rules เหล่านี้ใน `Config.validate()`
++
++---
++
++### 9. Structured Logging (JSON)
++
++**ไฟล์**: `main.py` (setup_logging)
++**ปัญหา**: Log format ปัจจุบันเป็น plain text — ยากต่อการ search/filter ใน CloudWatch หรือ ELK
++**แนวทาง**:
++
++- เพิ่ม option สำหรับ JSON logging (ใช้ `python-json-logger`)
++- แต่ละ log entry มี structured fields: `symbol`, `action`, `price`, `profit`
++
++---
++
++### 10. Secrets Management
++
++**ไฟล์**: `config.py`, `.env`
++**ปัญหา**: Database password, API keys อยู่ใน plaintext `.env` — ถ้า server ถูก compromise จะโดนทั้งหมด
++**แนวทาง**:
++
++- ใช้ AWS Secrets Manager หรือ AWS Systems Manager Parameter Store
++- ถ้ายังใช้ `.env` ให้ set file permission `chmod 600 .env`
++- `.gitignore` ครอบคลุมแล้ว ✅
++
++---
++
++## 🟢 P2 — Nice to Have (เพิ่มคุณภาพระยะยาว)
++
++### 11. Unit Tests
++
++**ปัญหา**: ไม่มี test เลย — ทำให้ไม่มั่นใจเมื่อแก้โค้ด
++**แนวทาง**:
++
++- `tests/test_grid_calculation.py` — ทดสอบ grid levels, order amount, grid step
++- `tests/test_order_fill.py` — ทดสอบ fill logic (buy→sell, sell→buy, profit calculation)
++- `tests/test_risk_management.py` — ทดสอบ stop-loss trigger
++- `tests/test_database.py` — ทดสอบ CRUD ด้วย SQLite หรือ testcontainers
++- `tests/test_config.py` — ทดสอบ validation
++
++```
++pytest
++pytest-cov
++```
++
++---
++
++### 12. Dockerfile & docker-compose
++
++**ปัญหา**: ไม่มี containerization → deploy ยาก, environment ไม่ consistent
++**แนวทาง**:
++
++```dockerfile
++FROM python:3.11-slim
++WORKDIR /app
++COPY requirements.txt .
++RUN pip install --no-cache-dir -r requirements.txt
++COPY . .
++CMD ["python", "main.py"]
++```
++
++```yaml
++# docker-compose.yml
++services:
++  grid-bot:
++    build: .
++    env_file: .env
++    restart: unless-stopped
++    volumes:
++      - ./logs:/app/logs
++```
++
++---
++
++### 13. Dynamic Grid Adjustment
++
++**ปัญหา**: เมื่อราคาหลุด grid range บอทจะแจ้งเตือนแล้วรอ — ไม่ทำอะไร
++**แนวทาง**:
++
++- เพิ่ม option `AUTO_ADJUST_GRID=true` → เมื่อราคาหลุด range ให้ cancel orders เดิม แล้ว re-setup grid ใหม่รอบราคาปัจจุบัน
++- หรือ shift grid ขึ้น/ลง 50% ของ step เมื่อราคาชิดขอบ
++
++---
++
++### 14. Profit Calculation — Include Fees
++
++**ไฟล์**: `grid_bot.py` (`_handle_fill`)
++**ปัญหา**: Profit คำนวณจาก `(sell_price - buy_price) * amount` แต่ **ไม่หัก trading fee** → กำไรที่แสดงจะสูงกว่าความเป็นจริง
++**แนวทาง**:
++
++- ดึง fee rate จาก exchange (`exchange.fees['trading']['taker']`)
++- คำนวณ: `net_profit = gross_profit - (buy_value + sell_value) * fee_rate`
++
++---
++
++### 15. Web Dashboard / API
++
++**ปัญหา**: ดูสถานะได้แค่ผ่าน Telegram + Google Sheets — ไม่ real-time, ไม่ interactive
++**แนวทาง**:
++
++- เพิ่ม lightweight REST API (FastAPI / Flask) บน port แยก
++- Endpoints: `GET /status`, `GET /trades`, `GET /profit`, `POST /stop`
++- หรือเพิ่ม Grafana + Prometheus metrics exporter
++
++---
++
++### 16. Unrealized PnL Tracking
++
++**ปัญหา**: `total_profit` แสดงแค่ **realized profit** (จาก sell orders) — ไม่แสดง unrealized PnL จาก positions ที่ถืออยู่
++**แนวทาง**:
++
++- คำนวณ `unrealized_pnl = net_position * (current_price - avg_buy_price)`
++- แสดงใน hourly summary: `Total PnL = Realized + Unrealized`
++- เก็บ average entry price ใน state
++
++---
++
++### 17. Multi-Symbol Risk Management
++
++**ปัญหา**: `MAX_LOSS_PCT` ตรวจ per-symbol เท่านั้น — ไม่มี total portfolio risk limit
++**แนวทาง**:
++
++- เพิ่ม `MAX_TOTAL_LOSS` → หยุดทุก symbol ถ้า total loss across all symbols เกินกำหนด
++- เพิ่ม `MAX_TOTAL_EXPOSURE` → จำกัด total position value
++
++---
++
++### 18. Order Tracking Gap
++
++**ไฟล์**: `exchange_client.py` (`_live_check_fills`)
++**ปัญหา**: Live mode check fills ทีละ order ด้วย `fetch_order()` → ช้าเมื่อมีหลาย open orders, และอาจ miss fills ถ้า check ไม่ทัน
++**แนวทาง**:
++
++- ใช้ `fetch_open_orders()` แทน → ดึงทุก open orders ใน 1 call
++- orders ที่เคย open แต่ไม่อยู่ใน response = filled
++- หรือใช้ WebSocket (ccxt pro) เพื่อรับ fill events real-time
++
++---
++
++## 📊 Summary
++
++| Priority | #   | หัวข้อ                    | ผลกระทบ                                 |
++| -------- | --- | ------------------------- | --------------------------------------- |
++| 🔴 P0    | 1   | DB auto-reconnect         | Bot crash เมื่อ RDS restart             |
++| 🔴 P0    | 2   | Exchange API retry        | Order หาย เมื่อ rate limit              |
++| 🔴 P0    | 3   | SIGTERM handling          | Orders ไม่ถูก cancel เมื่อ service stop |
++| 🔴 P0    | 4   | Typo ใน service file      | systemd enable ไม่ทำงาน                 |
++| 🟡 P1    | 5   | Telegram rate limit       | Bot ถูก block ส่งข้อความ                |
++| 🟡 P1    | 6   | Google Sheets batching    | API quota exceeded                      |
++| 🟡 P1    | 7   | Pin dependencies          | Breaking changes จาก update             |
++| 🟡 P1    | 8   | Config validation เพิ่ม   | Invalid config → unexpected behavior    |
++| 🟡 P1    | 9   | Structured logging        | ยาก search/debug ใน production          |
++| 🟡 P1    | 10  | Secrets management        | Security risk                           |
++| 🟢 P2    | 11  | Unit tests                | Regression bugs                         |
++| 🟢 P2    | 12  | Docker                    | Deployment consistency                  |
++| 🟢 P2    | 13  | Dynamic grid adjustment   | Idle เมื่อราคาหลุด range                |
++| 🟢 P2    | 14  | Fee ใน profit calculation | กำไรแสดงเกินจริง                        |
++| 🟢 P2    | 15  | Web dashboard             | ดูสถานะยาก                              |
++| 🟢 P2    | 16  | Unrealized PnL            | ไม่เห็นภาพ portfolio จริง               |
++| 🟢 P2    | 17  | Portfolio risk mgmt       | ไม่มี total exposure limit              |
++| 🟢 P2    | 18  | Order fill detection      | ช้า/miss fills ใน live mode             |
