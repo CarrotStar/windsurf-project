@@ -20,4 +20,4 @@ StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=multi-user.targetๅ
+WantedBy=multi-user.target

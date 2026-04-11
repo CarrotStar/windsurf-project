@@ -83,18 +83,23 @@ def main() -> None:
         threads.append(t)
         logger.info("Thread started for %s", sym.symbol)
 
-    # Keep main thread alive and wait for KeyboardInterrupt (Ctrl+C) for graceful shutdown.
-    try:
-        for t in threads:
-            t.join()  # This will block until all bot threads have completed.
-    except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt — stopping all bots…")
+    # --- Graceful Shutdown Handling ---
+    # Set up signal handlers for SIGINT (Ctrl+C) and SIGTERM (sent by systemd).
+    def shutdown_handler(signum, frame):
+        # Use signal.Signals(signum).name to get a readable signal name
+        logger.info("Signal %s received — stopping all bots...", signal.Signals(signum).name)
         for bot in bots:
             bot.running = False  # Signal each bot's main loop to exit
-        for t in threads:
-            t.join()  # Wait for each thread to finish its cleanup (_stop() method)
-        logger.info("All bots have stopped.")
-        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
+
+    # Wait for all bot threads to complete. They will exit when their `bot.running`
+    # flag is set to False by the shutdown_handler.
+    for t in threads:
+        t.join()
+
+    logger.info("All bots have stopped. Exiting.")
 
 
 if __name__ == "__main__":
