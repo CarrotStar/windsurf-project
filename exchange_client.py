@@ -335,6 +335,18 @@ class ExchangeClient:
             params["secret"] = self.config.API_SECRET
 
         exchange: ccxt.Exchange = exchange_cls(params)
+
+        # Restrict market loading to only the required type.
+        # ccxt Binance's load_markets() calls multiple authenticated SAPI endpoints
+        # (margin/allPairs, capital/config/getall) when loading all market types.
+        # We only need spot OR linear futures, so skip all others.
+        if self.is_futures:
+            exchange.options['fetchMarkets'] = ['linear']
+        else:
+            exchange.options['fetchMarkets'] = ['spot']
+        exchange.options['fetchCurrencies'] = False
+        exchange.has['fetchCurrencies'] = False
+
         if not self.paper_trading and self.config.TESTNET:
             if self.config.EXCHANGE.lower() == "binance" and self.is_futures:
                 if hasattr(exchange, "enable_demo_trading"):
