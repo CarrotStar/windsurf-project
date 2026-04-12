@@ -6,6 +6,17 @@ from typing import Optional
 
 import ccxt
 
+# Transient ccxt errors that are safe to retry
+_RETRYABLE = (
+    ccxt.NetworkError,
+    ccxt.ExchangeNotAvailable,
+    ccxt.RequestTimeout,
+    ccxt.RateLimitExceeded,
+)
+
+_MAX_RETRIES = 3
+_BASE_DELAY = 1.0  # seconds
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,8 +61,26 @@ class ExchangeClient:
     # Public API
     # ------------------------------------------------------------------
 
+    def _retry_call(self, func, *args, **kwargs):
+        """Execute *func* with exponential backoff on transient exchange errors."""
+        last_exc = None
+        for attempt in range(_MAX_RETRIES):
+            try:
+                return func(*args, **kwargs)
+            except _RETRYABLE as exc:
+                last_exc = exc
+                delay = _BASE_DELAY * (2 ** attempt)
+                logger.warning(
+                    "Exchange request failed (attempt %d/%d): %s — retrying in %.1fs",
+                    attempt + 1, _MAX_RETRIES, exc, delay,
+                )
+                time.sleep(delay)
+            except ccxt.BaseError:
+                raise  # non-transient errors bubble immediately
+        raise last_exc  # type: ignore[misc]
+
     def get_current_price(self) -> float:
-        ticker = self._exchange.fetch_ticker(self.symbol)
+        ticker = self._retry_call(self._exchange.fetch_ticker, self.symbol)
         price = float(ticker["last"])
         logger.debug("Current price %s: %.4f", self.symbol, price)
         return price
@@ -95,7 +124,7 @@ class ExchangeClient:
         if not self.is_futures:
             return {}
         try:
-            info = self._exchange.fetch_funding_rate(self.symbol)
+            info = self._retry_call(self._exchange.fetch_funding_rate, self.symbol)
             return {
                 "rate": float(info.get("fundingRate", 0) or 0),
                 "next_time": float(info.get("fundingTimestamp", 0) or info.get("timestamp", 0) or 0),
@@ -110,7 +139,7 @@ class ExchangeClient:
             return 0.0
         try:
             if not self._exchange.markets:
-                self._exchange.load_markets()
+                self._retry_call(self._exchange.load_markets)
             market = self._exchange.market(self.symbol)
             return float(market.get("limits", {}).get("cost", {}).get("min") or 0.0)
         except ccxt.BaseError as exc:
@@ -193,12 +222,14 @@ class ExchangeClient:
     ) -> Optional[Order]:
         try:
             if order_type == "buy":
-                result = self._exchange.create_limit_buy_order(
-                    self.symbol, amount, price
+                result = self._retry_call(
+                    self._exchange.create_limit_buy_order,
+                    self.symbol, amount, price,
                 )
             else:
-                result = self._exchange.create_limit_sell_order(
-                    self.symbol, amount, price
+                result = self._retry_call(
+                    self._exchange.create_limit_sell_order,
+                    self.symbol, amount, price,
                 )
             logger.info(
                 "Live order placed: %s %.6f @ %.4f | id=%s",
@@ -220,7 +251,7 @@ class ExchangeClient:
             logger.warning("Skipping cancellation of paper order in live mode: %s", order_id)
             return False
         try:
-            self._exchange.cancel_order(order_id, self.symbol)
+            self._retry_call(self._exchange.cancel_order, order_id, self.symbol)
             logger.info("Order cancelled: %s", order_id)
             return True
         except ccxt.BaseError as exc:
@@ -228,20 +259,37 @@ class ExchangeClient:
             return False
 
     def _live_check_fills(self, open_orders: dict[str, Order]) -> list[Order]:
+        """Detect fills using a single fetch_open_orders() call.
+
+        Orders that were tracked as open but are no longer present in the
+        exchange response are assumed filled. We then call fetch_order()
+        individually only for those orders to retrieve the fill price.
+        This reduces API calls from O(N) to O(1) + O(filled).
+        """
+        live = {oid: o for oid, o in open_orders.items() if not oid.startswith("paper_")}
+        if not live:
+            return []
+
+        try:
+            exchange_open = self._retry_call(self._exchange.fetch_open_orders, self.symbol)
+            exchange_open_ids = {o["id"] for o in exchange_open}
+        except ccxt.BaseError as exc:
+            logger.error("Failed to fetch open orders for %s: %s", self.symbol, exc)
+            return []
+
         filled: list[Order] = []
-        for order_id, order in list(open_orders.items()):
-            if order_id.startswith("paper_"):
-                logger.warning("Skipping check of paper order in live mode: %s", order_id)
-                continue
+        for order_id, order in live.items():
+            if order_id in exchange_open_ids:
+                continue  # still open
             try:
-                result = self._exchange.fetch_order(order_id, self.symbol)
+                result = self._retry_call(self._exchange.fetch_order, order_id, self.symbol)
                 if result["status"] in ("closed", "filled"):
                     order.status = "filled"
                     order.filled_price = float(result.get("average") or result["price"])
                     order.filled_at = time.time()
                     filled.append(order)
             except ccxt.BaseError as exc:
-                logger.error("Failed to check order %s: %s", order_id, exc)
+                logger.error("Failed to confirm fill for order %s: %s", order_id, exc)
         return filled
 
     # ------------------------------------------------------------------
@@ -269,7 +317,10 @@ class ExchangeClient:
     def _build_exchange(self) -> ccxt.Exchange:
         exchange_cls = getattr(ccxt, self.config.EXCHANGE.lower())
         market_type = "future" if self.is_futures else "spot"
-        params: dict = {"options": {"defaultType": market_type}}
+        params: dict = {
+            "options": {"defaultType": market_type},
+            "enableRateLimit": True,
+        }
 
         # Only attach API keys for live trading with valid (non-placeholder) keys
         valid_key = (

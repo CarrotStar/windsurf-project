@@ -61,10 +61,18 @@ class Config:
 
     # Risk management
     MAX_LOSS_PCT: float = float(os.getenv("MAX_LOSS_PCT", "20"))  # Stop bot if loss > X% of investment
+    MAX_TOTAL_LOSS: float = float(os.getenv("MAX_TOTAL_LOSS", "0"))  # 0 = disabled; stop ALL bots if combined loss exceeds this
+
+    # Trading costs
+    FEE_RATE: float = float(os.getenv("FEE_RATE", "0.001"))  # 0.1% default maker/taker fee (decimal)
+
+    # Grid behaviour
+    AUTO_ADJUST_GRID: bool = os.getenv("AUTO_ADJUST_GRID", "false").lower() == "true"
 
     # Bot settings
     CHECK_INTERVAL: int = int(os.getenv("CHECK_INTERVAL", "30"))
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+    LOG_JSON: bool = os.getenv("LOG_JSON", "false").lower() == "true"
 
     @classmethod
     def get_symbol_configs(cls) -> "list[SymbolConfig]":
@@ -99,6 +107,16 @@ class Config:
                 errors.append(f"{sc.symbol}: INVESTMENT must be positive")
         if not (0 < cls.MAX_LOSS_PCT <= 100):
             errors.append("MAX_LOSS_PCT must be between 0 and 100")
+        if cls.LEVERAGE < 1:
+            errors.append("LEVERAGE must be >= 1")
+        if cls.CHECK_INTERVAL <= 0:
+            errors.append("CHECK_INTERVAL must be > 0")
+        if cls.MARKET_TYPE not in ("spot", "future"):
+            errors.append(f"MARKET_TYPE must be 'spot' or 'future', got '{cls.MARKET_TYPE}'")
+        if cls.FEE_RATE < 0 or cls.FEE_RATE > 0.1:
+            errors.append("FEE_RATE must be between 0 and 0.1 (10%)")
+        if cls.MAX_TOTAL_LOSS < 0:
+            errors.append("MAX_TOTAL_LOSS must be >= 0 (0 = disabled)")
         if not cls.PAPER_TRADING:
             if not cls.API_KEY or cls.API_KEY == "your_exchange_api_key":
                 errors.append("API_KEY is required for live trading")
@@ -127,7 +145,9 @@ class Config:
             f"Market        : {mkt}{lev}\n"
             f"Mode          : {'Paper Trading' if cls.PAPER_TRADING else 'Live Trading'}\n"
             f"Symbols       :\n{sym_lines}"
-            f"Max Loss      : {cls.MAX_LOSS_PCT}% per symbol\n"
+            f"Max Loss      : {cls.MAX_LOSS_PCT}% per symbol"
+            + (f" | Total Loss Limit: ${cls.MAX_TOTAL_LOSS:,.2f}" if cls.MAX_TOTAL_LOSS > 0 else "") + "\n"
+            f"Fee Rate      : {cls.FEE_RATE * 100:.3f}% | Auto-Adjust Grid: {cls.AUTO_ADJUST_GRID}\n"
             f"Database      : {cls.DB_USER}@{cls.DB_HOST}:{cls.DB_PORT}/{cls.DB_NAME}\n"
-            f"Check Interval: {cls.CHECK_INTERVAL}s"
+            f"Check Interval: {cls.CHECK_INTERVAL}s | JSON Logging: {cls.LOG_JSON}"
         )

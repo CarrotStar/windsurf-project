@@ -145,20 +145,64 @@ class Database:
             sslmode=c.DB_SSL_MODE,
             connect_timeout=10,
             application_name="grid_trading_bot",
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=3,
         )
 
     @contextmanager
     def _conn(self):
-        """Yield a connection from the pool; commit or rollback automatically."""
-        conn = self._pool.getconn()
+        """Yield a connection from the pool; commit or rollback automatically.
+
+        If the pool is broken (e.g. RDS restarted), rebuild it and retry once.
+        """
+        conn = None
+        try:
+            conn = self._pool.getconn()
+        except Exception:
+            logger.warning("Connection pool broken — rebuilding…")
+            try:
+                self._pool.closeall()
+            except Exception:
+                pass
+            self._pool = self._build_pool()
+            conn = self._pool.getconn()
         try:
             yield conn
             conn.commit()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
+            # Connection died mid-query — rollback, discard, rebuild pool
+            logger.warning("DB connection lost during query: %s — rebuilding pool", exc)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            self._pool.putconn(conn, close=True)
+            conn = None  # prevent double-putconn in finally
+            try:
+                self._pool.closeall()
+            except Exception:
+                pass
+            self._pool = self._build_pool()
+            raise
         except Exception:
             conn.rollback()
             raise
         finally:
-            self._pool.putconn(conn)
+            if conn is not None:
+                self._pool.putconn(conn)
+
+    def health_check(self) -> bool:
+        """Verify the database connection is alive (SELECT 1)."""
+        try:
+            with self._conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+            return True
+        except Exception as exc:
+            logger.error("Database health check failed: %s", exc)
+            return False
 
     def _migrate(self) -> None:
         with self._conn() as conn:

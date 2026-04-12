@@ -23,10 +23,15 @@ class GridState:
     initial_price: float = 0.0
     recovered: bool = False  # True when state was loaded from DB
     net_position_amount: float = 0.0
+    avg_entry_price: float = 0.0   # weighted average cost for net_position (#16)
     # Funding rate tracking (futures only)
     total_funding_profit: float = 0.0
     next_funding_ts_ms: float = 0.0
     last_known_funding_rate: float = 0.0
+
+
+_DB_WRITE_INTERVAL = 300     # write stats to DB at most every 5 minutes
+_SHEETS_UPDATE_INTERVAL = 600  # update Sheets summary at most every 10 minutes
 
 
 class GridBot:
@@ -58,6 +63,7 @@ class GridBot:
         telegram: TelegramNotifier,
         sheets: GoogleSheetsLogger,
         db: Database,
+        portfolio_risk=None,
     ):
         self.config = config    # global settings (MAX_LOSS_PCT, CHECK_INTERVAL, etc.)
         self.sym = sym          # per-symbol settings (symbol, lower/upper price, etc.)
@@ -65,11 +71,14 @@ class GridBot:
         self.telegram = telegram
         self.sheets = sheets
         self.db = db
+        self._portfolio_risk = portfolio_risk
         self.state = GridState()
         self.running = False
         self._last_summary_at: float = 0.0
         self._summary_interval: int = 3600  # hourly
         self._out_of_range_notified: bool = False
+        self._last_db_write_at: float = 0.0
+        self._last_sheets_update_at: float = 0.0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -236,29 +245,43 @@ class GridBot:
                 self._send_summary(current_price)
                 self._last_summary_at = time.time()
 
-            # Persist cumulative stats to DB
-            self.db.update_stats(
-                symbol=self.sym.symbol,
-                total_profit=self.state.total_profit,
-                total_trades=self.state.total_trades,
-                total_funding_profit=self.state.total_funding_profit,
-                next_funding_ts_ms=self.state.next_funding_ts_ms,
-                last_known_funding_rate=self.state.last_known_funding_rate,
-            )
+            # Portfolio risk check (#17)
+            if self._portfolio_risk and self._portfolio_risk.report_profit(
+                self.sym.symbol, self.state.total_profit
+            ):
+                self._portfolio_risk.stop_all(self.telegram, self.sheets)
+                return
 
-            # Keep Google Sheets summary row up to date
-            self.sheets.update_summary({
-                "symbol": self.sym.symbol,
-                "current_price": current_price,
-                "open_orders": len(self.state.open_orders),
-                "total_trades": self.state.total_trades,
-                "total_profit": self.state.total_profit,
-                "runtime": _runtime(self.state.start_time),
-            })
+            now = time.time()
+
+            # Persist stats to DB — always after fills, otherwise throttled (#DB throttle)
+            if filled_orders or (now - self._last_db_write_at >= _DB_WRITE_INTERVAL):
+                self.db.update_stats(
+                    symbol=self.sym.symbol,
+                    total_profit=self.state.total_profit,
+                    total_trades=self.state.total_trades,
+                    total_funding_profit=self.state.total_funding_profit,
+                    next_funding_ts_ms=self.state.next_funding_ts_ms,
+                    last_known_funding_rate=self.state.last_known_funding_rate,
+                )
+                self._last_db_write_at = now
+
+            # Update Google Sheets summary — throttled to once 10 minutes
+            if now - self._last_sheets_update_at >= _SHEETS_UPDATE_INTERVAL:
+                self.sheets.update_summary({
+                    "symbol": self.sym.symbol,
+                    "current_price": current_price,
+                    "open_orders": len(self.state.open_orders),
+                    "total_trades": self.state.total_trades,
+                    "total_profit": self.state.total_profit,
+                    "runtime": _runtime(self.state.start_time),
+                })
+                self._last_sheets_update_at = now
 
         except Exception as exc:
             logger.error("Error during tick: %s", exc, exc_info=True)
             self.telegram.send_message(f"❌ *Bot Error*\n`{exc}`")
+            self.sheets.log_bot_event(f"ERROR [{self.sym.symbol}]", str(exc))
 
     # ------------------------------------------------------------------
     # Grid setup
@@ -342,8 +365,18 @@ class GridBot:
         step = self._grid_step()
         profit = 0.0
 
+        fee_rate = getattr(self.config, "FEE_RATE", 0.001)
+
         if order.order_type == "buy":
+            old_pos = self.state.net_position_amount
             self.state.net_position_amount += order.amount
+            # Update weighted average entry price (#16)
+            fill_px = order.filled_price or order.price
+            if self.state.net_position_amount > 0:
+                self.state.avg_entry_price = (
+                    (old_pos * self.state.avg_entry_price + order.amount * fill_px)
+                    / self.state.net_position_amount
+                )
             sell_price = self.exchange.format_price(order.price + step)
             if sell_price <= self.sym.upper_price:
                 sell_amount = self._order_amount(sell_price)
@@ -356,8 +389,13 @@ class GridBot:
 
         elif order.order_type == "sell":
             self.state.net_position_amount -= order.amount
+            if self.state.net_position_amount <= 0:
+                self.state.avg_entry_price = 0.0
             buy_price = self.exchange.format_price(order.price - step)
-            profit = (order.price - buy_price) * order.amount
+            # Gross profit minus both-side fees (#14)
+            gross = (order.price - buy_price) * order.amount
+            fee = (buy_price + order.price) * order.amount * fee_rate
+            profit = gross - fee
             self.state.total_profit += profit
 
             if buy_price >= self.sym.lower_price:
@@ -388,12 +426,16 @@ class GridBot:
 
         emoji = "🟢" if order.order_type == "sell" else "🔵"
         profit_line = f"\nGrid Profit  : `+${profit:,.6f}`" if profit > 0 else ""
+        fee_line = ""
+        if order.order_type == "sell" and profit > 0:
+            fee_paid = (self.exchange.format_price(order.price - step) + order.price) * order.amount * fee_rate
+            fee_line = f" *(net of ${fee_paid:,.6f} fee)*"
         msg = (
             f"{emoji} *Order Filled* — {order.order_type.upper()} `{self.sym.symbol}`\n"
             f"Price        : `{order.filled_price:,.4f}`\n"
             f"Amount       : `{order.amount:.6f}`\n"
             f"Value        : `${(order.filled_price or 0) * order.amount:,.2f}`"
-            f"{profit_line}\n"
+            f"{profit_line}{fee_line}\n"
             f"Total Profit : `${self.state.total_profit:,.6f}`"
         )
         self.telegram.send_message(msg)
@@ -451,19 +493,51 @@ class GridBot:
             direction = "Below" if current_price < self.sym.lower_price else "Above"
             bound = self.sym.lower_price if current_price < self.sym.lower_price else self.sym.upper_price
             logger.warning("Price %.4f is %s grid bound %.4f", current_price, direction.lower(), bound)
-            self.telegram.send_message(
-                f"⚠️ *Price {direction} Grid Range*\n"
-                f"Current : `{current_price:,.4f}`\n"
-                f"{'Lower' if direction == 'Below' else 'Upper'}   : `{bound:,.4f}`\n"
-                f"Consider adjusting the grid or stopping the bot."
-            )
-            self._out_of_range_notified = True
+            if getattr(self.config, "AUTO_ADJUST_GRID", False):
+                self._adjust_grid(current_price)
+            else:
+                self.telegram.send_message(
+                    f"⚠️ *Price {direction} Grid Range*\n"
+                    f"Current : `{current_price:,.4f}`\n"
+                    f"{'Lower' if direction == 'Below' else 'Upper'}   : `{bound:,.4f}`\n"
+                    f"Consider adjusting the grid or stopping the bot."
+                )
+                self._out_of_range_notified = True
         elif in_range and self._out_of_range_notified:
             self._out_of_range_notified = False  # Reset when price returns
+
+    def _adjust_grid(self, current_price: float) -> None:
+        """Re-centre the grid around current_price keeping the same range width (#13)."""
+        half_range = (self.sym.upper_price - self.sym.lower_price) / 2
+        new_lower = self.exchange.format_price(current_price - half_range)
+        new_upper = self.exchange.format_price(current_price + half_range)
+        logger.info(
+            "[%s] Auto-adjusting grid [%.2f, %.2f] → [%.2f, %.2f]",
+            self.sym.symbol, self.sym.lower_price, self.sym.upper_price, new_lower, new_upper,
+        )
+        for order_id in list(self.state.open_orders):
+            self.exchange.cancel_order(order_id)
+            self.db.mark_order_cancelled(order_id, self.sym.symbol)
+        self.state.open_orders.clear()
+        self.sym.lower_price = new_lower
+        self.sym.upper_price = new_upper
+        self._out_of_range_notified = False
+        self._setup_grid(current_price)
+        msg = (
+            f"🔄 *Grid Auto-Adjusted* — `{self.sym.symbol}`\n"
+            f"New Range: `{new_lower:,.2f}` — `{new_upper:,.2f}`"
+        )
+        self.telegram.send_message(msg)
+        self.sheets.log_bot_event(f"GRID_ADJUSTED [{self.sym.symbol}]", msg)
 
     def _send_summary(self, current_price: float) -> None:
         runtime = _runtime(self.state.start_time)
         roi = (self.state.total_profit / self.sym.investment) * 100 if self.sym.investment else 0
+        # Unrealized PnL (#16)
+        unrealized_pnl = 0.0
+        if self.state.net_position_amount > 0 and self.state.avg_entry_price > 0:
+            unrealized_pnl = self.state.net_position_amount * (current_price - self.state.avg_entry_price)
+        total_pnl = self.state.total_profit + unrealized_pnl
         funding_line = ""
         if self.exchange.is_futures:
             funding_line = f"Funding P/L  : `${self.state.total_funding_profit:,.6f}`\n"
@@ -474,7 +548,9 @@ class GridBot:
             f"Open Orders  : `{len(self.state.open_orders)}`\n"
             f"Total Trades : `{self.state.total_trades}`\n"
             f"{funding_line}"
-            f"Total Profit : `${self.state.total_profit:,.6f}` ({roi:+.3f}%)\n"
+            f"Realized P/L : `${self.state.total_profit:,.6f}` ({roi:+.3f}%)\n"
+            f"Unrealized PnL: `${unrealized_pnl:,.6f}` (pos={self.state.net_position_amount:.4f})\n"
+            f"Total PnL    : `${total_pnl:,.6f}`\n"
             f"Runtime      : `{runtime}`"
         )
         self.telegram.send_message(msg)

@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -7,6 +8,9 @@ from typing import Any
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+
+_FLUSH_INTERVAL = 60   # batch flush every N seconds
+_MAX_BUFFER = 20       # flush immediately when buffer reaches this size
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +49,9 @@ class GoogleSheetsLogger:
         self.enabled = False
         self.service = None
         self._lock = threading.Lock()  # httplib2 is NOT thread-safe
+        self._trade_buffer: list[list] = []
+        self._buffer_lock = threading.Lock()
+        self._last_flush_at: float = 0.0
 
         creds_path = Path(credentials_file) if credentials_file else None
         if not creds_path or not creds_path.exists():
@@ -98,7 +105,7 @@ class GoogleSheetsLogger:
     # ------------------------------------------------------------------
 
     def log_trade(self, trade: dict) -> None:
-        """Append a completed trade row to the transactions worksheet."""
+        """Buffer a completed trade row; batch-flushes when buffer is full or interval elapsed."""
         if not self.enabled:
             logger.debug("Sheets disabled | trade: %s", trade)
             return
@@ -112,12 +119,30 @@ class GoogleSheetsLogger:
             _fmt(trade.get("profit", 0), 6),
             _fmt(trade.get("total_profit", 0), 6),
         ]
-        self._append_row(self.worksheet_name, row)
+        flush_now = False
+        with self._buffer_lock:
+            self._trade_buffer.append(row)
+            if (len(self._trade_buffer) >= _MAX_BUFFER
+                    or time.time() - self._last_flush_at >= _FLUSH_INTERVAL):
+                flush_now = True
+        if flush_now:
+            self.flush_trades()
+
+    def flush_trades(self) -> None:
+        """Batch-append all buffered trade rows to Google Sheets in one API call."""
+        with self._buffer_lock:
+            if not self._trade_buffer:
+                return
+            rows = self._trade_buffer[:]
+            self._trade_buffer.clear()
+            self._last_flush_at = time.time()
+        self._batch_append(self.worksheet_name, rows)
 
     def update_summary(self, summary: dict) -> None:
         """Overwrite a per-symbol row on the Summary sheet (row = symbol_index + 2)."""
         if not self.enabled:
             return
+        self.flush_trades()  # ensure buffered trades are written first
         symbol = summary.get("symbol", "")
         row_num = self._summary_row(symbol)
         row = [
@@ -145,9 +170,10 @@ class GoogleSheetsLogger:
             logger.debug("Sheets disabled | event: %s", event)
             return
         clean_details = details.replace("\n", " | ").replace("*", "")
+        is_error = event.upper().startswith("ERROR")
         row = [
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            event,
+            f"{'🔴 ' if is_error else ''}{event}",
             clean_details,
         ]
         self._append_row(SHEET_EVENTS, row)
@@ -197,7 +223,10 @@ class GoogleSheetsLogger:
             logger.error("Failed to set header for %s: %s", sheet_name, exc)
 
     def _append_row(self, sheet_name: str, row: list[Any]) -> None:
-        if not self.service:
+        self._batch_append(sheet_name, [row])
+
+    def _batch_append(self, sheet_name: str, rows: list[list]) -> None:
+        if not self.service or not rows:
             return
         try:
             with self._lock:
@@ -205,12 +234,13 @@ class GoogleSheetsLogger:
                     spreadsheetId=self.sheet_id,
                     range=f"{sheet_name}!A:A",
                     valueInputOption="RAW",
-                    body={"values": [row]},
+                    body={"values": rows},
                 ).execute()
+            logger.debug("Sheets batch append: %d row(s) → %s", len(rows), sheet_name)
         except HttpError as exc:
-            logger.error("Sheets append failed (%s): %s", sheet_name, exc)
+            logger.error("Sheets batch append failed (%s): %s", sheet_name, exc)
         except Exception as exc:
-            logger.warning("Sheets append error (%s): %s", sheet_name, exc)
+            logger.warning("Sheets batch append error (%s): %s", sheet_name, exc)
 
     def _update_range(self, range_name: str, values: list[list[Any]]) -> None:
         if not self.service:
