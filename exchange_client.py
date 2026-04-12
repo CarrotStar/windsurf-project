@@ -348,14 +348,19 @@ class ExchangeClient:
         exchange.has['fetchCurrencies'] = False
 
         if not self.paper_trading and self.config.TESTNET:
-            if self.config.EXCHANGE.lower() == "binance" and self.is_futures:
+            is_binance = self.config.EXCHANGE.lower() == "binance"
+            if is_binance and self.is_futures:
+                # Binance futures testnet deprecated — use demo trading mode
                 if hasattr(exchange, "enable_demo_trading"):
                     exchange.enable_demo_trading(True)
                     logger.info("Binance futures demo trading mode enabled")
                 else:
-                    logger.warning("Binance demo trading mode not found in this ccxt version. Consider upgrading ccxt.")
+                    logger.warning(
+                        "enable_demo_trading not found — upgrade ccxt: pip install 'ccxt>=4.4.50'"
+                    )
+            elif hasattr(exchange, "set_sandbox_mode"):
+                exchange.set_sandbox_mode(True)
+                logger.info("Testnet/sandbox mode enabled for %s", self.config.EXCHANGE)
             else:
-                if hasattr(exchange, "set_sandbox_mode"):
-                    exchange.set_sandbox_mode(True)
-                    logger.info("Exchange sandbox/testnet mode enabled")
+                logger.warning("No sandbox/demo method found — verify TESTNET setting")
         return exchange
