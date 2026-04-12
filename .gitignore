@@ -15,6 +15,12 @@ build/
 venv/
 env/
 
+# Backtest output
+backtest_results/*.csv
+backtest_results/*.txt
+backtest_results/*.png
+
 # Keep folder placeholders
 !credentials/.gitkeep
 !logs/.gitkeep
+!backtest_results/.gitkeep
