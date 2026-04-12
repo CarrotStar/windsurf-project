@@ -318,7 +318,10 @@ class ExchangeClient:
         exchange_cls = getattr(ccxt, self.config.EXCHANGE.lower())
         market_type = "future" if self.is_futures else "spot"
         params: dict = {
-            "options": {"defaultType": market_type},
+            "options": {
+                "defaultType": market_type,
+                "fetchCurrencies": not self.paper_trading,  # avoid authenticated SAPI call in paper mode
+            },
             "enableRateLimit": True,
         }
 
