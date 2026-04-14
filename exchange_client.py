@@ -146,6 +146,19 @@ class ExchangeClient:
             logger.warning("Failed to fetch market limits for %s: %s", self.symbol, exc)
             return 0.0
 
+    def get_market_min_amount(self) -> float:
+        """Fetch the minimum order quantity from exchange limits."""
+        if self.paper_trading:
+            return 0.0
+        try:
+            if not self._exchange.markets:
+                self._retry_call(self._exchange.load_markets)
+            market = self._exchange.market(self.symbol)
+            return float(market.get("limits", {}).get("amount", {}).get("min") or 0.0)
+        except ccxt.BaseError as exc:
+            logger.warning("Failed to fetch market amount limits for %s: %s", self.symbol, exc)
+            return 0.0
+
     def format_price(self, price: float) -> float:
         """Format price according to exchange precision rules."""
         try:

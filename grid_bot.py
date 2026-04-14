@@ -252,6 +252,14 @@ class GridBot:
                 self._portfolio_risk.stop_all(self.telegram, self.sheets)
                 return
 
+            # Self-heal: if no open orders remain, re-fill the grid
+            if self.running and not self.state.open_orders:
+                logger.warning(
+                    "[%s] No open orders detected — re-filling grid at price %.4f",
+                    self.sym.symbol, current_price,
+                )
+                self._refill_grid(current_price)
+
             now = time.time()
 
             # Persist stats to DB — always after fills, otherwise throttled (#DB throttle)
@@ -291,7 +299,8 @@ class GridBot:
         # Check if investment per grid meets the exchange minimum notional
         amount_per_grid = self.sym.investment / self.sym.grid_count
         min_cost = self.exchange.get_market_min_cost()
-        
+        min_amount = self.exchange.get_market_min_amount()
+
         if min_cost and amount_per_grid < min_cost:
             err_msg = (
                 f"❌ *Grid Setup Failed*\n"
@@ -305,6 +314,31 @@ class GridBot:
             self.sheets.log_bot_event(f"SETUP_FAILED [{self.sym.symbol}]", err_msg)
             self.running = False
             return
+
+        if min_amount:
+            sample_price = (self.sym.lower_price + self.sym.upper_price) / 2
+            raw_amount = amount_per_grid / sample_price
+            fmt_amount = self.exchange.format_amount(raw_amount)
+            if fmt_amount < min_amount:
+                min_investment = min_amount * sample_price * self.sym.grid_count
+                err_msg = (
+                    f"❌ *Grid Setup Failed*\n"
+                    f"Symbol: `{self.sym.symbol}`\n"
+                    f"Amount per grid (`{fmt_amount:.6f}`) is below the exchange minimum "
+                    f"quantity (`{min_amount}`).\n"
+                    f"👉 *Fix*: Increase `INVESTMENT` to at least `${min_investment:,.2f}` "
+                    f"or decrease `GRID_COUNT`."
+                )
+                logger.error(
+                    "[%s] Grid setup failed: formatted amount %.6f < min amount %.6f "
+                    "(need investment >= %.2f for %d grids at price ~%.2f)",
+                    self.sym.symbol, fmt_amount, min_amount, min_investment,
+                    self.sym.grid_count, sample_price,
+                )
+                self.telegram.send_message(err_msg)
+                self.sheets.log_bot_event(f"SETUP_FAILED [{self.sym.symbol}]", err_msg)
+                self.running = False
+                return
 
         self.state.levels = self._calculate_levels()
         self.state.initial_price = current_price
@@ -486,6 +520,33 @@ class GridBot:
     def _order_amount(self, price: float) -> float:
         amount_per_grid = self.sym.investment / self.sym.grid_count
         return self.exchange.format_amount(amount_per_grid / price)
+
+    def _refill_grid(self, current_price: float) -> None:
+        """Re-place grid orders when open_orders is empty (self-healing)."""
+        placed = 0
+        for i, level in enumerate(self.state.levels[:-1]):
+            amount = self._order_amount(level)
+            if level < current_price:
+                order = self.exchange.place_order("buy", level, amount, i)
+            elif level > current_price:
+                order = self.exchange.place_order("sell", level, amount, i)
+            else:
+                continue
+            if order:
+                self.state.open_orders[order.id] = order
+                self.db.upsert_order(order, self.sym.symbol)
+                placed += 1
+
+        if placed:
+            logger.info("[%s] Grid re-filled — %d orders placed", self.sym.symbol, placed)
+            self.telegram.send_message(
+                f"🔧 *Grid Re-filled* — `{self.sym.symbol}`\n"
+                f"Orders Placed: `{placed}`\n"
+                f"Current Price: `{current_price:,.4f}`"
+            )
+            self.sheets.log_bot_event(f"GRID_REFILLED [{self.sym.symbol}]", f"Re-filled {placed} orders at {current_price:.4f}")
+        else:
+            logger.error("[%s] Grid re-fill failed — 0 orders placed", self.sym.symbol)
 
     def _check_range(self, current_price: float) -> None:
         in_range = self.sym.lower_price <= current_price <= self.sym.upper_price
